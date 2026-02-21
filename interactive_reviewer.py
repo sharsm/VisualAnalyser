@@ -142,27 +142,46 @@ class InteractiveReviewer:
         # Crack tip (red solid)
         self.ax_img.axvline(x_tip, color='red', ls='-', lw=2.2, label='Crack tip')
 
-        # ROI rows (yellow dotted)
-        self.ax_img.axhline(row_top, color='yellow', ls=':', lw=0.8, alpha=0.5)
-        self.ax_img.axhline(row_bot, color='yellow', ls=':', lw=0.8, alpha=0.5)
+        # ROI rectangle (red)
+        from matplotlib.patches import Rectangle
+        roi_rect = Rectangle(
+            (x_left, row_top),
+            x_right - x_left, row_bot - row_top,
+            linewidth=1.2, edgecolor='red', facecolor='none',
+            linestyle='--', alpha=0.7
+        )
+        self.ax_img.add_patch(roi_rect)
 
-        # W_lig bracket
-        y_ann = row_top + (row_bot - row_top) * 0.08
+        arm_a = dict(arrowstyle='<->', color='orange', lw=1.8)
+        arm_b = dict(arrowstyle='<->', color='deepskyblue', lw=1.8)
+
+        # W_lig bracket  (orange – ligament from crack tip to free edge)
+        y_lig  = row_top + (row_bot - row_top) * 0.08
+        # W_full bracket (blue   – full specimen width)
+        y_full = row_top + (row_bot - row_top) * 0.20
+
         ns = self.params['notch_side']
         if ns == 'right':
-            arm_a = dict(arrowstyle='<->', color='orange', lw=1.8)
-            self.ax_img.annotate('', xy=(x_left, y_ann), xytext=(x_tip, y_ann),
+            self.ax_img.annotate('', xy=(x_left, y_lig), xytext=(x_tip, y_lig),
                                  arrowprops=arm_a)
-            self.ax_img.text((x_left + x_tip) / 2, y_ann - 7,
+            self.ax_img.text((x_left + x_tip) / 2, y_lig - 7,
                              'W_lig', ha='center', color='orange', fontsize=8,
                              fontweight='bold')
         else:
-            arm_a = dict(arrowstyle='<->', color='orange', lw=1.8)
-            self.ax_img.annotate('', xy=(x_right, y_ann), xytext=(x_tip, y_ann),
+            self.ax_img.annotate('', xy=(x_tip, y_lig), xytext=(x_right, y_lig),
                                  arrowprops=arm_a)
-            self.ax_img.text((x_tip + x_right) / 2, y_ann - 7,
+            self.ax_img.text((x_tip + x_right) / 2, y_lig - 7,
                              'W_lig', ha='center', color='orange', fontsize=8,
                              fontweight='bold')
+
+        # W_full bracket (always x_left → x_right)
+        self.ax_img.annotate('', xy=(x_left, y_full), xytext=(x_right, y_full),
+                             arrowprops=arm_b)
+        W_full_mm = float(row['W_full_mm'])
+        self.ax_img.text((x_left + x_right) / 2, y_full - 7,
+                         f'W_full = {W_full_mm:.2f} mm',
+                         ha='center', color='deepskyblue', fontsize=8,
+                         fontweight='bold')
 
         status = '  ✓ CORRECTED' if corr else ''
         flag_str = f'{self.cur + 1} / {len(self.flagged)}'

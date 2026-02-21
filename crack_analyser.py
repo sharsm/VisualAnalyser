@@ -9,9 +9,11 @@ and identifies the onset frame of crack propagation.
 Expected image setup
 --------------------
 - Bright/grey sample on dark background
-- Horizontal crack (grows right→left by default; change notch_side if needed)
-- Pre-cut notch on the right edge of the specimen
-- Scale: 63 px = 1 mm  (can be changed at runtime)
+- Horizontal crack growing left→right (notch always on the LEFT)
+- W_full,0 is auto-detected from the first frame
+- Image threshold is auto-computed via Otsu's method
+- Fixed parameters: fps = 5 Hz, onset threshold = 0.1 mm
+- Only user input required at startup: image folder + mm/pixel scale factor
 """
 
 import cv2
@@ -44,36 +46,58 @@ def load_image(path) -> np.ndarray:
     return img
 
 
+def compute_otsu_threshold(image: np.ndarray) -> int:
+    """Return the optimal binary threshold via Otsu's method."""
+    thresh_val, _ = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return int(thresh_val)
+
+
 # ── Sample geometry detection ─────────────────────────────────────────────────
 
-def detect_sample_row_range(image: np.ndarray, margin_frac: float = 0.20) -> tuple:
+def detect_sample_row_range(image: np.ndarray,
+                             margin_frac: float = 0.05,
+                             search_top_frac: float = 0.78) -> tuple:
     """
-    Find the vertical extent of the specimen body by looking for the largest
-    contiguous band of bright rows (row-mean intensity > 60 % of max).
+    Find the vertical extent of the specimen body.
 
-    60 % is chosen to exclude dark grip-gap rows (typically < 50 % of max)
-    while keeping the bright specimen body rows (typically > 70 % of max).
+    Setup: the specimen (hydrogel) is at the VERY BOTTOM of the image.
+    The metal grip hardware occupies the upper ~78 % of the image.
+    We therefore search only below `search_top_frac` of the image height,
+    which skips both the upper grip and the large metal lower-grip plate.
 
-    Returns (row_top, row_bottom) using the middle (1-2·margin_frac) of the
-    bright band, which avoids grip-edge noise.
+    Within that search zone we find the largest contiguous band of rows
+    whose mean intensity exceeds 60 % of the local maximum.  This threshold
+    is high enough to separate the hydrogel specimen from the dark background
+    below it while still capturing the full specimen height.
+
+    Returns (row_top, row_bottom) with a small inward margin.
     """
-    row_means = image.mean(axis=1)
-    thresh = row_means.max() * 0.60
+    h = image.shape[0]
+    search_start = int(h * search_top_frac)
+
+    sub = image[search_start:, :]
+    row_means = sub.mean(axis=1)
+    local_max = row_means.max()
+
+    if local_max == 0:
+        return int(h * 0.80), int(h * 0.95)
+
+    thresh = local_max * 0.60          # separates hydrogel from dark bottom
     bright = (row_means > thresh).astype(int)
 
-    diff = np.diff(bright, prepend=0, append=0)
-    starts = np.where(diff == 1)[0]
-    ends = np.where(diff == -1)[0]
+    diff   = np.diff(bright, prepend=0, append=0)
+    starts = np.where(diff ==  1)[0]
+    ends   = np.where(diff == -1)[0]
 
     if len(starts) == 0:
-        h = image.shape[0]
-        return int(h * margin_frac), int(h * (1 - margin_frac))
+        return int(h * 0.80), int(h * 0.95)
 
     lengths = ends - starts
-    best = int(np.argmax(lengths))
-    top, bot = starts[best], ends[best]
+    best    = int(np.argmax(lengths))
+    top = starts[best] + search_start
+    bot = ends[best]   + search_start
 
-    margin = int((bot - top) * margin_frac)
+    margin = max(int((bot - top) * margin_frac), 2)
     return int(top + margin), int(bot - margin)
 
 
@@ -103,7 +127,7 @@ def detect_sample_edges(image: np.ndarray, row_top: int, row_bottom: int,
 
 def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
                      row_top: int, row_bottom: int,
-                     notch_side: str = 'right',
+                     notch_side: str = 'left',
                      threshold: int = 60) -> tuple:
     """
     Detect the crack tip x-coordinate using a column-wise dark-fraction scan,
@@ -199,38 +223,57 @@ def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
 
 # ── Batch processing ──────────────────────────────────────────────────────────
 
-def process_all_frames(image_paths: list, notch_side: str = 'right',
-                        threshold: int = 60) -> pd.DataFrame:
+def process_all_frames(image_paths: list, notch_side: str = 'left',
+                        threshold: int = None,
+                        x_left_fixed: int = None,
+                        x_right_fixed: int = None) -> pd.DataFrame:
     """
-    Auto-detect sample edges and crack tip for every frame.
+    Auto-detect crack tip for every frame.
 
-    The ROI (row_top, row_bottom) is detected from the first frame and reused
-    for all subsequent frames to keep measurements consistent.
+    Geometry (row_top, row_bottom, x_left, x_right) is detected from the
+    first frame and kept FIXED for all subsequent frames.  This is physically
+    correct because the specimen does not move laterally, and avoids the
+    problem where open-crack rows give a wrong x_left estimate in later frames.
+
+    If threshold is None, Otsu's method is applied to the first frame.
 
     Returns a DataFrame with one row per frame.
     """
     records = []
     row_top = row_bottom = None
+    _threshold = threshold
+    _x_left  = x_left_fixed
+    _x_right = x_right_fixed
 
     for i, path in enumerate(tqdm(image_paths, desc='Detecting crack tips', unit='frame')):
         img = load_image(path)
 
         if row_top is None:
             row_top, row_bottom = detect_sample_row_range(img)
+            if _threshold is None:
+                _threshold = compute_otsu_threshold(img)
+            if _x_left is None or _x_right is None:
+                _x_left, _x_right = detect_sample_edges(
+                    img, row_top, row_bottom, _threshold
+                )
 
-        x_left, x_right = detect_sample_edges(img, row_top, row_bottom, threshold)
-        x_tip, conf = detect_crack_tip(img, x_left, x_right, row_top, row_bottom,
-                                        notch_side, threshold)
+        # Clamp ROI to current image height (frames may differ in size)
+        h = img.shape[0]
+        rt = min(row_top,    h - 1)
+        rb = min(row_bottom, h - 1)
+
+        x_tip, conf = detect_crack_tip(img, _x_left, _x_right, rt, rb,
+                                        notch_side, _threshold)
 
         records.append({
             'frame'     : i,
             'path'      : str(path),
-            'x_left'    : x_left,
-            'x_right'   : x_right,
+            'x_left'    : _x_left,
+            'x_right'   : _x_right,
             'x_tip'     : x_tip,
             'confidence': conf,
-            'row_top'   : row_top,
-            'row_bottom': row_bottom,
+            'row_top'   : rt,
+            'row_bottom': rb,
             'corrected' : False,
         })
 
@@ -242,8 +285,8 @@ def process_all_frames(image_paths: list, notch_side: str = 'right',
 # ── Measurement calculation ───────────────────────────────────────────────────
 
 def compute_measurements(df: pd.DataFrame, scale_mm_per_pixel: float,
-                          W_full_0_mm: float, notch_side: str = 'right',
-                          fps: float = 4.0) -> pd.DataFrame:
+                          W_full_0_mm: float, notch_side: str = 'left',
+                          fps: float = 5.0) -> pd.DataFrame:
     """
     Add physical measurement columns to the DataFrame in-place (on a copy).
 
@@ -433,7 +476,9 @@ def export_plot(df: pd.DataFrame, output_path: str, onset_frame: int = -1):
 def ask_parameters() -> dict:
     """
     Collect run parameters interactively via tkinter dialogs.
-    Returns a dict with all parameters, or an empty dict if cancelled.
+    Returns a dict with folder and scale_mm_per_pixel, or an empty dict if
+    cancelled.  All other parameters (notch side, fps, thresholds, W_full_0)
+    are determined automatically inside main().
     """
     root = tk.Tk()
     root.withdraw()
@@ -444,78 +489,23 @@ def ask_parameters() -> dict:
         root.destroy()
         return {}
 
-    def ask(title, prompt, default):
-        return simpledialog.askstring(
-            title, prompt, initialvalue=str(default), parent=root
-        )
-
-    scale_s = ask(
+    scale_s = simpledialog.askstring(
         'Scale',
         'Scale factor (mm per pixel).\n'
-        'Example: 1/63 ≈ 0.01587  (63 px = 1 mm)',
-        '0.01587'
+        'Example: if 63 px = 1 mm  →  enter  0.01587',
+        initialvalue='0.01587',
+        parent=root,
     )
     if scale_s is None:
-        root.destroy(); return {}
-
-    wfull_s = ask(
-        'Initial Width',
-        'Initial full sample width  W_full,0  (mm):',
-        '10.0'
-    )
-    if wfull_s is None:
-        root.destroy(); return {}
-
-    notch_s = ask(
-        'Notch Side',
-        "Which side holds the notch?\n"
-        "Enter  'left'  or  'right'  (default: right):",
-        'right'
-    )
-    if notch_s is None:
-        root.destroy(); return {}
-    notch_s = notch_s.strip().lower()
-    if notch_s not in ('left', 'right'):
-        messagebox.showerror('Error', "Notch side must be 'left' or 'right'.")
-        root.destroy(); return {}
-
-    onset_s = ask(
-        'Onset Threshold',
-        'Onset detection: Δa threshold (mm).\n'
-        'Crack propagation starts when Δa persistently exceeds this value.',
-        '0.05'
-    )
-    if onset_s is None:
-        root.destroy(); return {}
-
-    thresh_s = ask(
-        'Image Threshold',
-        'Pixel intensity threshold to separate sample (bright) from\n'
-        'background/crack (dark).  Range 0–255:',
-        '60'
-    )
-    if thresh_s is None:
-        root.destroy(); return {}
-
-    fps_s = ask(
-        'Frame Rate',
-        'Camera frame rate (frames per second):',
-        '4.0'
-    )
-    if fps_s is None:
-        root.destroy(); return {}
+        root.destroy()
+        return {}
 
     root.destroy()
 
     try:
         return {
-            'folder'             : folder,
-            'scale_mm_per_pixel' : float(scale_s),
-            'W_full_0_mm'        : float(wfull_s),
-            'notch_side'         : notch_s,
-            'onset_threshold_mm' : float(onset_s),
-            'img_threshold'      : int(thresh_s),
-            'fps'                : float(fps_s),
+            'folder'            : folder,
+            'scale_mm_per_pixel': float(scale_s),
         }
     except ValueError as exc:
         print(f'Parameter error: {exc}')
@@ -539,27 +529,47 @@ def main():
         return
 
     print(f'Found {len(paths)} image(s) in:  {params["folder"]}')
-    print(f'Scale: {params["scale_mm_per_pixel"]:.5f} mm/px  |  '
-          f'W_full,0 = {params["W_full_0_mm"]} mm  |  '
-          f'Notch side: {params["notch_side"]}')
 
-    # ── Batch auto-detection ──
-    df_raw = process_all_frames(
-        paths, params['notch_side'], params['img_threshold']
-    )
+    # ── Fixed parameters ──────────────────────────────────────────────────────
+    NOTCH_SIDE          = 'left'
+    FPS                 = 5.0
+    ONSET_THRESHOLD_MM  = 0.1
 
-    # ── Restore previous session if available ──
+    # ── Auto-detect threshold from first frame (Otsu) ─────────────────────────
+    first_img = load_image(paths[0])
+    threshold = compute_otsu_threshold(first_img)
+    print(f'Otsu threshold (first frame): {threshold}')
+
+    # ── Auto-detect W_full,0 from first frame ─────────────────────────────────
+    row_top_0, row_bottom_0 = detect_sample_row_range(first_img)
+    x_left_0, x_right_0    = detect_sample_edges(first_img, row_top_0, row_bottom_0, threshold)
+    W_full_0_px = x_right_0 - x_left_0
+    W_full_0_mm = W_full_0_px * params['scale_mm_per_pixel']
+    print(f'W_full,0 = {W_full_0_mm:.3f} mm  ({W_full_0_px} px)  |  '
+          f'Notch: {NOTCH_SIDE}  |  fps: {FPS}  |  '
+          f'Onset thresh: {ONSET_THRESHOLD_MM} mm')
+
+    # Store auto-detected values so the reviewer can access them
+    params.update({
+        'W_full_0_mm'       : W_full_0_mm,
+        'notch_side'        : NOTCH_SIDE,
+        'onset_threshold_mm': ONSET_THRESHOLD_MM,
+        'img_threshold'     : threshold,
+        'fps'               : FPS,
+    })
+
+    # ── Batch auto-detection ──────────────────────────────────────────────────
+    df_raw = process_all_frames(paths, NOTCH_SIDE, threshold,
+                                x_left_fixed=x_left_0,
+                                x_right_fixed=x_right_0)
+
+    # ── Restore previous session if available ─────────────────────────────────
     df_raw = load_session(df_raw, params['folder'])
 
-    df = compute_measurements(
-        df_raw,
-        params['scale_mm_per_pixel'],
-        params['W_full_0_mm'],
-        params['notch_side'],
-        params['fps'],
-    )
+    df = compute_measurements(df_raw, params['scale_mm_per_pixel'],
+                              W_full_0_mm, NOTCH_SIDE, FPS)
 
-    # ── Interactive review ──
+    # ── Interactive review ────────────────────────────────────────────────────
     flagged = flag_uncertain_frames(df)
     print(f'Flagged {len(flagged)} frame(s) for review.')
 
@@ -570,18 +580,13 @@ def main():
     reviewer.run()
     df = reviewer.df   # DataFrame updated with user corrections
 
-    # ── Final recompute + onset ──
-    df = compute_measurements(
-        df,
-        params['scale_mm_per_pixel'],
-        params['W_full_0_mm'],
-        params['notch_side'],
-        params['fps'],
-    )
+    # ── Final recompute + onset ───────────────────────────────────────────────
+    df = compute_measurements(df, params['scale_mm_per_pixel'],
+                              W_full_0_mm, NOTCH_SIDE, FPS)
 
-    onset = find_onset_frame(df, params['onset_threshold_mm'])
+    onset = find_onset_frame(df, ONSET_THRESHOLD_MM)
 
-    # ── Export ──
+    # ── Export ────────────────────────────────────────────────────────────────
     folder = params['folder']
     export_csv(df, str(Path(folder) / 'crack_measurements.csv'), onset)
     export_plot(df, str(Path(folder) / 'crack_measurements.png'), onset)
