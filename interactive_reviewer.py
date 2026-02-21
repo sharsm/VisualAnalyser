@@ -25,8 +25,9 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from pathlib import Path
 import numpy as np
+import json
 
-from crack_analyser import load_image
+from crack_analyser import load_image, save_session
 
 
 class InteractiveReviewer:
@@ -50,6 +51,10 @@ class InteractiveReviewer:
         self.flagged     = sorted(set(flagged_indices))
         self.params      = params
         self.cur         = 0              # position within self.flagged
+        self.session_path = (
+            Path(self.image_paths[0]).parent / '_va_session.json'
+            if self.image_paths else None
+        )
 
         if not self.flagged:
             print('No frames to review.')
@@ -211,6 +216,7 @@ class InteractiveReviewer:
         self.df.loc[fi, 'corrected'] = True
 
         self._recompute_all()
+        self._save_session()
         self._update_display()
 
     def _on_key(self, event):
@@ -243,12 +249,20 @@ class InteractiveReviewer:
             wf_mm = wf * s
             wl_mm = wl * s
 
+            self.df.at[i, 'W_full_px'] = wf
+            self.df.at[i, 'W_lig_px']  = wl
             self.df.at[i, 'W_full_mm'] = wf_mm
             self.df.at[i, 'W_lig_mm']  = wl_mm
             self.df.at[i, 'a_mm']      = (1.0 - wl_mm / max(wf_mm, 1e-6)) * W0
 
         a_0 = float(self.df['a_mm'].iloc[0])
         self.df['delta_a_mm'] = self.df['a_mm'] - a_0
+
+    def _save_session(self):
+        """Persist all corrected x_tip values to disk after every click."""
+        if self.session_path is None:
+            return
+        save_session(self.df, str(self.session_path.parent))
 
     # ── Run ───────────────────────────────────────────────────────────────────
 

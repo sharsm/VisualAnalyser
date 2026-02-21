@@ -21,6 +21,7 @@ from pathlib import Path
 from tqdm import tqdm
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
+import json
 
 SUPPORTED_EXT = {'.png', '.tif', '.tiff', '.bmp', '.jpg', '.jpeg'}
 
@@ -361,6 +362,72 @@ def export_csv(df: pd.DataFrame, output_path: str, onset_frame: int = -1):
         print('Crack propagation onset: not detected (Δa never exceeded threshold).')
 
 
+# ── Session persistence ───────────────────────────────────────────────────────
+
+def save_session(df: pd.DataFrame, folder: str):
+    """Save corrected x_tip values to a JSON file in the image folder."""
+    corrected = df[df['corrected'] == True]
+    data = {str(int(row['frame'])): int(row['x_tip'])
+            for _, row in corrected.iterrows()}
+    session_path = Path(folder) / '_va_session.json'
+    with open(session_path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def load_session(df: pd.DataFrame, folder: str) -> pd.DataFrame:
+    """
+    Load and apply crack-tip corrections from a previous session file.
+    Returns the (possibly updated) DataFrame.
+    """
+    session_path = Path(folder) / '_va_session.json'
+    if not session_path.exists():
+        return df
+
+    with open(session_path) as f:
+        data = json.load(f)
+
+    count = 0
+    for frame_str, x_tip in data.items():
+        fi = int(frame_str)
+        if fi in df.index:
+            df.loc[fi, 'x_tip']    = int(x_tip)
+            df.loc[fi, 'corrected'] = True
+            count += 1
+
+    print(f'Loaded {count} correction(s) from previous session ({session_path.name}).')
+    return df
+
+
+# ── Plot export ───────────────────────────────────────────────────────────────
+
+def export_plot(df: pd.DataFrame, output_path: str, onset_frame: int = -1):
+    """Save the Δa vs frame chart as a PNG (backend-independent)."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    fig = Figure(figsize=(10, 5))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+
+    ax.plot(df['frame'], df['delta_a_mm'], 'b-', lw=1.5, label='Δa(λ)')
+
+    if onset_frame >= 0:
+        mask = df['frame'] == onset_frame
+        t_vals = df.loc[mask, 'time_s'].values
+        t_str  = f'  (t = {t_vals[0]:.3f} s)' if len(t_vals) else ''
+        ax.axvline(onset_frame, color='red', ls='--', lw=1.5,
+                   label=f'Onset frame {onset_frame}{t_str}')
+
+    ax.set_xlabel('Frame', fontsize=11)
+    ax.set_ylabel('Δa (mm)', fontsize=11)
+    ax.set_title('Crack propagation  Δa vs frame', fontsize=12)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.30)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    print(f'Plot saved   → {output_path}')
+
+
 # ── Parameter dialogs ─────────────────────────────────────────────────────────
 
 def ask_parameters() -> dict:
@@ -430,6 +497,14 @@ def ask_parameters() -> dict:
     if thresh_s is None:
         root.destroy(); return {}
 
+    fps_s = ask(
+        'Frame Rate',
+        'Camera frame rate (frames per second):',
+        '4.0'
+    )
+    if fps_s is None:
+        root.destroy(); return {}
+
     root.destroy()
 
     try:
@@ -440,7 +515,7 @@ def ask_parameters() -> dict:
             'notch_side'         : notch_s,
             'onset_threshold_mm' : float(onset_s),
             'img_threshold'      : int(thresh_s),
-            'fps'                : 4.0,      # 4 frames per second
+            'fps'                : float(fps_s),
         }
     except ValueError as exc:
         print(f'Parameter error: {exc}')
@@ -472,6 +547,10 @@ def main():
     df_raw = process_all_frames(
         paths, params['notch_side'], params['img_threshold']
     )
+
+    # ── Restore previous session if available ──
+    df_raw = load_session(df_raw, params['folder'])
+
     df = compute_measurements(
         df_raw,
         params['scale_mm_per_pixel'],
@@ -503,8 +582,9 @@ def main():
     onset = find_onset_frame(df, params['onset_threshold_mm'])
 
     # ── Export ──
-    output_path = str(Path(params['folder']) / 'crack_measurements.csv')
-    export_csv(df, output_path, onset)
+    folder = params['folder']
+    export_csv(df, str(Path(folder) / 'crack_measurements.csv'), onset)
+    export_plot(df, str(Path(folder) / 'crack_measurements.png'), onset)
 
 
 if __name__ == '__main__':
