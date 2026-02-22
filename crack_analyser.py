@@ -156,7 +156,14 @@ def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
 
     # ── Step 1: column-wise dark fraction ─────────────────────────────────
     dark_frac = (sample < threshold).mean(axis=0)   # shape: (width,)
-    DARK_THRESH = 0.08                               # ≥8 % dark → crack column
+
+    # Threshold: 2 % of ROI rows dark per column is sufficient to mark a
+    # crack column.  The crack in a tall ROI occupies only a narrow band of
+    # rows, so the per-column dark fraction is small even at the open crack.
+    # Gap tolerance of 15 columns bridges the narrow crack tip where the
+    # opening is only a few pixels tall.
+    DARK_THRESH = 0.02
+    GAP_TOL     = 15   # consecutive below-threshold columns still bridged
 
     if notch_side == 'right':
         # Scan from RIGHT to LEFT; find leftmost column of contiguous dark
@@ -168,8 +175,7 @@ def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
                 found = True
                 last_dark_col = xi
             elif found:
-                # Allow up to 5 consecutive bright columns (artifact/gap)
-                look_left = dark_frac[max(0, xi - 4): xi]
+                look_left = dark_frac[max(0, xi - GAP_TOL): xi]
                 if not (look_left >= DARK_THRESH).any():
                     break   # sustained brightness → crack tip found
         x_tip = x_left + last_dark_col
@@ -183,7 +189,7 @@ def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
                 found = True
                 last_dark_col = xi
             elif found:
-                look_right = dark_frac[xi + 1: xi + 5]
+                look_right = dark_frac[xi + 1: xi + 1 + GAP_TOL]
                 if not (look_right >= DARK_THRESH).any():
                     break
         x_tip = x_left + last_dark_col
@@ -257,10 +263,12 @@ def process_all_frames(image_paths: list, notch_side: str = 'left',
                     img, row_top, row_bottom, _threshold
                 )
 
-        # Clamp ROI to current image height (frames may differ in size)
-        h = img.shape[0]
+        # Clamp ROI to current image height (frames may differ in size).
+        # Always extend the bottom to at least 98 % of frame height so that
+        # crack openings that grow downward in later frames are never cut off.
+        h  = img.shape[0]
         rt = min(row_top,    h - 1)
-        rb = min(row_bottom, h - 1)
+        rb = max(min(row_bottom, h - 1), int(h * 0.98))
 
         x_tip, conf = detect_crack_tip(img, _x_left, _x_right, rt, rb,
                                         notch_side, _threshold)
@@ -581,15 +589,22 @@ def main():
     df = reviewer.df   # DataFrame updated with user corrections
 
     # ── Final recompute + onset ───────────────────────────────────────────────
+    # Use params['W_full_0_mm'] — may have been updated by the user in the reviewer
+    # (by dragging the blue sample-edge lines to correct the specimen width).
+    W_full_0_mm = params['W_full_0_mm']
     df = compute_measurements(df, params['scale_mm_per_pixel'],
                               W_full_0_mm, NOTCH_SIDE, FPS)
 
     onset = find_onset_frame(df, ONSET_THRESHOLD_MM)
 
     # ── Export ────────────────────────────────────────────────────────────────
-    folder = params['folder']
-    export_csv(df, str(Path(folder) / 'crack_measurements.csv'), onset)
-    export_plot(df, str(Path(folder) / 'crack_measurements.png'), onset)
+    # Outputs go into a _results sub-folder so they are never picked up as
+    # input images on the next run.
+    out_dir = Path(params['folder']) / '_results'
+    out_dir.mkdir(exist_ok=True)
+    export_csv(df, str(out_dir / 'crack_measurements.csv'), onset)
+    export_plot(df, str(out_dir / 'crack_measurements.png'), onset)
+    save_session(df, params['folder'])   # session file stays next to the images
 
 
 if __name__ == '__main__':
