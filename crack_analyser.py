@@ -30,12 +30,20 @@ SUPPORTED_EXT = {'.png', '.tif', '.tiff', '.bmp', '.jpg', '.jpeg'}
 # ── Image loading ─────────────────────────────────────────────────────────────
 
 def load_image_paths(folder: str) -> list:
-    """Return sorted list of image paths in folder (by filename)."""
+    """Return naturally-sorted list of image paths in folder.
+
+    Uses numeric sort so that sample_1_2.png comes before sample_1_10.png,
+    not after it (which is what plain alphabetical sort would give).
+    """
+    import re
     folder = Path(folder)
-    paths = sorted(
-        [p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXT]
-    )
-    return paths
+    paths = [p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXT]
+
+    def _natural_key(p):
+        return [int(t) if t.isdigit() else t.lower()
+                for t in re.split(r'(\d+)', p.stem)]
+
+    return sorted(paths, key=_natural_key)
 
 
 def load_image(path) -> np.ndarray:
@@ -122,7 +130,13 @@ def detect_sample_edges(image: np.ndarray, row_top: int, row_bottom: int,
     if not x_lefts:
         return 0, image.shape[1] - 1
 
-    return int(np.median(x_lefts)), int(np.median(x_rights))
+    # Use the 5th-percentile for x_left (true specimen edge is the leftmost
+    # bright pixel; the notch makes most rows appear to start at a larger x).
+    # Use the 95th-percentile for x_right (symmetric reason: crack opening
+    # on the right side would push the apparent right edge left).
+    x_left  = int(np.percentile(x_lefts,  5))
+    x_right = int(np.percentile(x_rights, 95))
+    return x_left, x_right
 
 
 def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
@@ -326,40 +340,120 @@ def compute_measurements(df: pd.DataFrame, scale_mm_per_pixel: float,
     return df
 
 
+# ── Temporal smoothing ────────────────────────────────────────────────────────
+
+def smooth_crack_tips(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
+    """
+    Smooth x_tip using corrected frames as hard anchors.
+
+    Strategy
+    --------
+    1. Frames already marked 'corrected' are never changed.
+    2. Uncorrected frames that fall *between* two corrected frames are
+       linearly interpolated from those anchors.  This handles long runs
+       of bad auto-detections (e.g. 10 consecutive frames) that a rolling
+       median cannot fix.
+    3. Uncorrected frames that fall *outside* the corrected range (before
+       the first anchor or after the last anchor) are smoothed with a
+       rolling median (window=7) as a fallback.
+
+    The raw (pre-smoothing) value is preserved in x_tip_raw.
+    """
+    df = df.copy()
+    df['x_tip_raw'] = df['x_tip'].copy()
+
+    frames    = df.index.tolist()          # integer frame numbers
+    corrected = df['corrected'].values
+    tips      = df['x_tip'].values.astype(float)
+    n         = len(frames)
+
+    # ── Step 1: anchor-based linear interpolation ─────────────────────────
+    # Build list of (position, frame_index, x_tip) for corrected frames
+    anchors = [(pos, fi, int(tips[pos]))
+               for pos, fi in enumerate(frames) if corrected[pos]]
+
+    if len(anchors) >= 2:
+        for k in range(len(anchors) - 1):
+            p0, f0, v0 = anchors[k]
+            p1, f1, v1 = anchors[k + 1]
+            # Fill uncorrected positions between the two anchors
+            for pos in range(p0 + 1, p1):
+                if not corrected[pos]:
+                    # linear interpolation in frame-index space
+                    fi   = frames[pos]
+                    frac = (fi - f0) / max(f1 - f0, 1)
+                    tips[pos] = round(v0 + frac * (v1 - v0))
+
+    # ── Step 2: rolling median for frames outside the corrected range ─────
+    if anchors:
+        first_anchor_pos = anchors[0][0]
+        last_anchor_pos  = anchors[-1][0]
+    else:
+        first_anchor_pos = n
+        last_anchor_pos  = -1
+
+    # Positions outside anchor range (use rolling median on raw values)
+    raw = df['x_tip_raw'].values.astype(float)
+    smoothed_raw = (pd.Series(raw)
+                    .rolling(window=window, center=True, min_periods=1)
+                    .median()
+                    .round()
+                    .values)
+
+    for pos in range(n):
+        if corrected[pos]:
+            continue
+        if pos < first_anchor_pos or pos > last_anchor_pos:
+            tips[pos] = smoothed_raw[pos]
+
+    # ── Apply smoothed values ─────────────────────────────────────────────
+    for pos, fi in enumerate(frames):
+        if not corrected[pos]:
+            df.loc[fi, 'x_tip'] = int(tips[pos])
+
+    return df
+
+
 # ── Flagging ──────────────────────────────────────────────────────────────────
 
-def flag_uncertain_frames(df: pd.DataFrame) -> list:
+def flag_uncertain_frames(df: pd.DataFrame,
+                          deviation_thresh: int = 15,
+                          jump_thresh: int = 10) -> list:
     """
     Return sorted list of frame indices that should be reviewed by the user.
 
     Rules
     -----
-    - Frame 0 is always flagged (user must confirm the initial notch tip = a₀).
-    - Abrupt crack-tip jump (>5 px between consecutive frames).
-    - High per-frame confidence score (>3× median AND >2 px).
-    - Sudden change in sample width (>3 %, indicating possible sample slip).
+    - Frame 0 is always flagged (confirm initial notch tip = a₀).
+    - Raw detection deviated > deviation_thresh px from smoothed value
+      (indicates the raw detector was confused on that frame).
+    - Smoothed x_tip jumps > jump_thresh px vs previous frame
+      (real crack advance or lingering detection error).
     """
     flagged = {0}
 
     if len(df) < 2:
         return sorted(flagged)
 
-    med_conf = df['confidence'].median()
-    tips = df['x_tip'].values
+    raw_col   = 'x_tip_raw' if 'x_tip_raw' in df.columns else 'x_tip'
+    tips_raw    = df[raw_col].values
+    tips_smooth = df['x_tip'].values
+    corrected   = df['corrected'].values
+
+    for i in range(len(df)):
+        if corrected[i]:
+            continue   # user already reviewed this frame — skip
+        # Raw detector was far from smoothed consensus
+        if abs(int(tips_raw[i]) - int(tips_smooth[i])) > deviation_thresh:
+            flagged.add(i)
 
     for i in range(1, len(df)):
-        jump = abs(int(tips[i]) - int(tips[i - 1]))
-        if jump > 5:
+        if corrected[i]:
+            continue
+        # Smoothed tip jumped too fast (real event or residual error)
+        if abs(int(tips_smooth[i]) - int(tips_smooth[i - 1])) > jump_thresh:
             flagged.add(i)
             flagged.add(i - 1)
-
-        if df['confidence'].iloc[i] > med_conf * 3 and df['confidence'].iloc[i] > 2.0:
-            flagged.add(i)
-
-        w_prev = df['x_right'].iloc[i - 1] - df['x_left'].iloc[i - 1]
-        w_curr = df['x_right'].iloc[i]     - df['x_left'].iloc[i]
-        if w_prev > 0 and abs(w_curr - w_prev) / w_prev > 0.03:
-            flagged.add(i)
 
     return sorted(flagged)
 
@@ -573,6 +667,12 @@ def main():
 
     # ── Restore previous session if available ─────────────────────────────────
     df_raw = load_session(df_raw, params['folder'])
+
+    # ── Smooth x_tip with rolling median (suppresses ±2-3 px noise) ──────────
+    df_raw = smooth_crack_tips(df_raw, window=7)
+    print(f'Smoothing applied (window=7).  '
+          f'Max raw deviation: '
+          f'{(df_raw["x_tip_raw"] - df_raw["x_tip"]).abs().max():.0f} px')
 
     df = compute_measurements(df_raw, params['scale_mm_per_pixel'],
                               W_full_0_mm, NOTCH_SIDE, FPS)
