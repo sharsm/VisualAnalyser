@@ -34,10 +34,26 @@ def load_image_paths(folder: str) -> list:
 
     Uses numeric sort so that sample_1_2.png comes before sample_1_10.png,
     not after it (which is what plain alphabetical sort would give).
+
+    If a _va_skip.txt file exists next to the images, any file whose stem
+    appears in that file (one stem per line, # = comment) is excluded.
     """
     import re
     folder = Path(folder)
     paths = [p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXT]
+
+    # Load skip list if present
+    skip_file = folder / '_va_skip.txt'
+    skip_stems = set()
+    if skip_file.exists():
+        for line in skip_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                skip_stems.add(line.lower())
+        if skip_stems:
+            before = len(paths)
+            paths = [p for p in paths if p.stem.lower() not in skip_stems]
+            print(f'Skipping {before - len(paths)} frame(s) listed in _va_skip.txt.')
 
     def _natural_key(p):
         return [int(t) if t.isdigit() else t.lower()
@@ -244,16 +260,16 @@ def detect_crack_tip(image: np.ndarray, x_left: int, x_right: int,
 # ── Batch processing ──────────────────────────────────────────────────────────
 
 def process_all_frames(image_paths: list, notch_side: str = 'left',
-                        threshold: int = None,
-                        x_left_fixed: int = None,
-                        x_right_fixed: int = None) -> pd.DataFrame:
+                        threshold: int = None) -> pd.DataFrame:
     """
-    Auto-detect crack tip for every frame.
+    Auto-detect crack tip, x_left and x_right for every frame.
 
-    Geometry (row_top, row_bottom, x_left, x_right) is detected from the
-    first frame and kept FIXED for all subsequent frames.  This is physically
-    correct because the specimen does not move laterally, and avoids the
-    problem where open-crack rows give a wrong x_left estimate in later frames.
+    x_left and x_right are detected **per frame** so that W_full(λ) can vary
+    with Poisson lateral contraction as required by the formula:
+        a(λ) = (1 - W_lig(λ) / W_full(λ)) · W_full,0
+
+    The vertical ROI (row_top, row_bottom) is detected from the first frame
+    and kept fixed — the specimen does not move vertically between frames.
 
     If threshold is None, Otsu's method is applied to the first frame.
 
@@ -262,20 +278,20 @@ def process_all_frames(image_paths: list, notch_side: str = 'left',
     records = []
     row_top = row_bottom = None
     _threshold = threshold
-    _x_left  = x_left_fixed
-    _x_right = x_right_fixed
 
-    for i, path in enumerate(tqdm(image_paths, desc='Detecting crack tips', unit='frame')):
+    import re as _re
+    def _frame_num(p):
+        nums = _re.findall(r'\d+', Path(p).stem)
+        return int(nums[-1]) if nums else pos
+
+    for pos, path in enumerate(tqdm(image_paths, desc='Detecting crack tips', unit='frame')):
+        i = _frame_num(path)
         img = load_image(path)
 
         if row_top is None:
             row_top, row_bottom = detect_sample_row_range(img)
             if _threshold is None:
                 _threshold = compute_otsu_threshold(img)
-            if _x_left is None or _x_right is None:
-                _x_left, _x_right = detect_sample_edges(
-                    img, row_top, row_bottom, _threshold
-                )
 
         # Clamp ROI to current image height (frames may differ in size).
         # Always extend the bottom to at least 98 % of frame height so that
@@ -284,19 +300,26 @@ def process_all_frames(image_paths: list, notch_side: str = 'left',
         rt = min(row_top,    h - 1)
         rb = max(min(row_bottom, h - 1), int(h * 0.98))
 
+        # Detect x_left and x_right per frame (captures Poisson contraction).
+        _x_left, _x_right = detect_sample_edges(img, rt, rb, _threshold)
+
         x_tip, conf = detect_crack_tip(img, _x_left, _x_right, rt, rb,
                                         notch_side, _threshold)
 
         records.append({
-            'frame'     : i,
-            'path'      : str(path),
-            'x_left'    : _x_left,
-            'x_right'   : _x_right,
-            'x_tip'     : x_tip,
-            'confidence': conf,
-            'row_top'   : rt,
-            'row_bottom': rb,
-            'corrected' : False,
+            'frame'            : i,
+            'path'             : str(path),
+            'x_left'           : _x_left,
+            'x_right'          : _x_right,
+            'x_left_raw'       : _x_left,    # never modified; used for rolling-median fallback
+            'x_right_raw'      : _x_right,   # never modified; used for rolling-median fallback
+            'x_tip'            : x_tip,
+            'confidence'       : conf,
+            'row_top'          : rt,
+            'row_bottom'       : rb,
+            'corrected'        : False,
+            'x_left_corrected' : False,
+            'x_right_corrected': False,
         })
 
     df = pd.DataFrame(records)
@@ -334,13 +357,101 @@ def compute_measurements(df: pd.DataFrame, scale_mm_per_pixel: float,
     )
 
     a_0 = float(df['a_mm'].iloc[0])
-    df['delta_a_mm'] = df['a_mm'] - a_0
+    df['delta_a_mm'] = (df['a_mm'] - a_0).clip(lower=0)
     df['time_s']     = df['frame'] / fps
 
     return df
 
 
 # ── Temporal smoothing ────────────────────────────────────────────────────────
+
+def smooth_sample_edges(df: pd.DataFrame, window: int = 11) -> pd.DataFrame:
+    """
+    Smooth per-frame x_left and x_right with a rolling median.
+
+    Edge detection is noisier than crack-tip detection, so a wider window
+    (11 frames) is used.  Smoothing preserves the low-frequency Poisson
+    contraction trend while suppressing frame-to-frame noise.
+    """
+    df = df.copy()
+    for col in ('x_left', 'x_right'):
+        df[col] = (pd.Series(df[col].values.astype(float))
+                   .rolling(window=window, center=True, min_periods=1)
+                   .median()
+                   .round()
+                   .astype(int)
+                   .values)
+    return df
+
+
+def smooth_sample_edges_with_anchors(df: pd.DataFrame, window: int = 11) -> pd.DataFrame:
+    """
+    Smooth per-frame x_left and x_right using corrected frames as hard anchors.
+
+    Strategy (mirrors smooth_crack_tips):
+    1. Corrected frames (x_right_corrected / x_left_corrected = True) are kept exactly.
+    2. Uncorrected frames *between* two anchors → linear interpolation between anchors.
+    3. Uncorrected frames *outside* the anchor range → rolling median on the raw
+       auto-detected values (x_right_raw / x_left_raw), which preserves the
+       Poisson contraction trend while suppressing frame-to-frame noise.
+
+    If the corrected-flag columns are missing (old DataFrame), falls back to a
+    plain rolling median (same as the old smooth_sample_edges).
+    """
+    df = df.copy()
+
+    for col, corr_col, raw_col in [
+        ('x_right', 'x_right_corrected', 'x_right_raw'),
+        ('x_left',  'x_left_corrected',  'x_left_raw'),
+    ]:
+        # ── Fallback: no anchor columns → plain rolling median ────────────
+        if corr_col not in df.columns:
+            df[col] = (pd.Series(df[col].values.astype(float))
+                       .rolling(window=window, center=True, min_periods=1)
+                       .median().round().astype(int).values)
+            continue
+
+        frames    = df.index.tolist()
+        corrected = df[corr_col].values
+        vals      = df[col].values.astype(float)
+        n         = len(frames)
+
+        anchors = [(pos, fi, int(vals[pos]))
+                   for pos, fi in enumerate(frames) if corrected[pos]]
+
+        # ── Step 1: linear interpolation between anchors ──────────────────
+        if len(anchors) >= 2:
+            for k in range(len(anchors) - 1):
+                p0, f0, v0 = anchors[k]
+                p1, f1, v1 = anchors[k + 1]
+                for pos in range(p0 + 1, p1):
+                    if not corrected[pos]:
+                        frac = (frames[pos] - f0) / max(f1 - f0, 1)
+                        vals[pos] = round(v0 + frac * (v1 - v0))
+
+        # ── Step 2: rolling median on raw for frames outside anchor range ─
+        raw_vals = (df[raw_col].values.astype(float)
+                    if raw_col in df.columns else df[col].values.astype(float))
+        smoothed = (pd.Series(raw_vals)
+                    .rolling(window=window, center=True, min_periods=1)
+                    .median().round().values)
+
+        first_pos = anchors[0][0] if anchors else n
+        last_pos  = anchors[-1][0] if anchors else -1
+
+        for pos in range(n):
+            if corrected[pos]:
+                continue
+            if pos < first_pos or pos > last_pos:
+                vals[pos] = smoothed[pos]
+
+        # ── Apply smoothed values ─────────────────────────────────────────
+        for pos, fi in enumerate(frames):
+            if not corrected[pos]:
+                df.loc[fi, col] = int(vals[pos])
+
+    return df
+
 
 def smooth_crack_tips(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
     """
@@ -384,15 +495,19 @@ def smooth_crack_tips(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
                     frac = (fi - f0) / max(f1 - f0, 1)
                     tips[pos] = round(v0 + frac * (v1 - v0))
 
-    # ── Step 2: rolling median for frames outside the corrected range ─────
+    # ── Step 2: frames outside the corrected range ────────────────────────
     if anchors:
-        first_anchor_pos = anchors[0][0]
-        last_anchor_pos  = anchors[-1][0]
+        first_anchor_pos  = anchors[0][0]
+        first_anchor_val  = anchors[0][2]
+        last_anchor_pos   = anchors[-1][0]
+        last_anchor_val   = anchors[-1][2]
     else:
-        first_anchor_pos = n
-        last_anchor_pos  = -1
+        first_anchor_pos  = n
+        first_anchor_val  = None
+        last_anchor_pos   = -1
+        last_anchor_val   = None
 
-    # Positions outside anchor range (use rolling median on raw values)
+    # Frames BEFORE the first anchor: rolling median on raw values
     raw = df['x_tip_raw'].values.astype(float)
     smoothed_raw = (pd.Series(raw)
                     .rolling(window=window, center=True, min_periods=1)
@@ -403,8 +518,14 @@ def smooth_crack_tips(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
     for pos in range(n):
         if corrected[pos]:
             continue
-        if pos < first_anchor_pos or pos > last_anchor_pos:
+        if pos < first_anchor_pos:
+            # Pre-anchor region: rolling median is best we can do
             tips[pos] = smoothed_raw[pos]
+        elif pos > last_anchor_pos:
+            # Post-anchor region: hold the last corrected value constant.
+            # This is correct for pre-onset frames (notch tip doesn't move)
+            # and avoids the rolling-median artifact from bad raw detections.
+            tips[pos] = last_anchor_val
 
     # ── Apply smoothed values ─────────────────────────────────────────────
     for pos, fi in enumerate(frames):
@@ -418,27 +539,42 @@ def smooth_crack_tips(df: pd.DataFrame, window: int = 7) -> pd.DataFrame:
 
 def flag_uncertain_frames(df: pd.DataFrame,
                           deviation_thresh: int = 15,
-                          jump_thresh: int = 10) -> list:
+                          jump_thresh: int = 10,
+                          calibration_step: int = 50) -> list:
     """
     Return sorted list of frame indices that should be reviewed by the user.
 
     Rules
     -----
     - Frame 0 is always flagged (confirm initial notch tip = a₀).
-    - Raw detection deviated > deviation_thresh px from smoothed value
-      (indicates the raw detector was confused on that frame).
-    - Smoothed x_tip jumps > jump_thresh px vs previous frame
-      (real crack advance or lingering detection error).
+    - Every calibration_step-th frame is flagged until manually corrected
+      (periodic anchors so the user can calibrate x_tip and edges throughout).
+    - Raw detection deviated > deviation_thresh px from smoothed value.
+    - Smoothed x_tip jumps > jump_thresh px vs previous frame.
     """
     flagged = {0}
 
     if len(df) < 2:
         return sorted(flagged)
 
-    raw_col   = 'x_tip_raw' if 'x_tip_raw' in df.columns else 'x_tip'
+    raw_col     = 'x_tip_raw' if 'x_tip_raw' in df.columns else 'x_tip'
     tips_raw    = df[raw_col].values
     tips_smooth = df['x_tip'].values
     corrected   = df['corrected'].values
+    frames      = df['frame'].values
+
+    # Periodic calibration frames — flag until manually confirmed
+    # Dense (every 20) for frames 0-400, coarse (every 50) for 401-1500
+    calib_positions = [pos for pos, fi in enumerate(frames)
+                       if (fi <= 400 and fi % 20 == 0) or
+                          (400 < fi <= 1500 and fi % calibration_step == 0)]
+    uncalibrated = [pos for pos in calib_positions if not corrected[pos]]
+    for pos in uncalibrated:
+        flagged.add(pos)
+
+    # Uncertainty-based flagging only after all calibration frames are confirmed
+    if uncalibrated:
+        return sorted(flagged)
 
     for i in range(len(df)):
         if corrected[i]:
@@ -447,6 +583,8 @@ def flag_uncertain_frames(df: pd.DataFrame,
         if abs(int(tips_raw[i]) - int(tips_smooth[i])) > deviation_thresh:
             flagged.add(i)
 
+    delta_a = df['delta_a_mm'].values if 'delta_a_mm' in df.columns else None
+
     for i in range(1, len(df)):
         if corrected[i]:
             continue
@@ -454,6 +592,9 @@ def flag_uncertain_frames(df: pd.DataFrame,
         if abs(int(tips_smooth[i]) - int(tips_smooth[i - 1])) > jump_thresh:
             flagged.add(i)
             flagged.add(i - 1)
+        # Δa decreased vs previous frame (physically impossible — crack can't close)
+        if delta_a is not None and delta_a[i] < delta_a[i - 1]:
+            flagged.add(i)
 
     return sorted(flagged)
 
@@ -498,22 +639,191 @@ def export_csv(df: pd.DataFrame, output_path: str, onset_frame: int = -1):
     df[out_cols].to_csv(output_path, index=False, float_format='%.6f')
     print(f'\nResults saved → {output_path}')
 
+
+def export_annotated_tif(df: pd.DataFrame, paths: list, frame_indices: list,
+                         output_dir: str, onset_frame: int = -1):
+    """Save annotated TIF images for the requested frame indices."""
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    # Build frame→path lookup
+    frame_to_path = {int(df.loc[fi, 'frame']): paths[pos]
+                     for pos, fi in enumerate(df.index)}
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 36)
+        font_sm = ImageFont.truetype("arial.ttf", 28)
+    except Exception:
+        font = ImageFont.load_default()
+        font_sm = font
+
+    for fi in sorted(frame_indices):
+        if fi not in df.index:
+            print(f'  Frame {fi}: not in dataset, skipping.')
+            continue
+        row   = df.loc[fi]
+        fnum  = int(row['frame'])
+        path  = frame_to_path.get(fnum)
+        if path is None:
+            print(f'  Frame {fnum}: image path not found, skipping.')
+            continue
+
+        img = load_image(str(path))            # H×W uint8 grayscale
+        h, w = img.shape
+
+        pil = Image.fromarray(img).convert('RGB')
+        draw = ImageDraw.Draw(pil)
+
+        x_left   = int(row['x_left'])
+        x_right  = int(row['x_right'])
+        x_tip    = int(row['x_tip'])
+        row_top  = int(row['row_top'])  if 'row_top'  in df.columns else 0
+        row_bot  = int(row['row_bottom']) if 'row_bottom' in df.columns else h - 1
+
+        # ROI top/bottom (orange dashed)
+        for x in range(0, w, 20):
+            draw.line([(x, row_top), (x + 10, row_top)], fill=(255, 165, 0), width=3)
+            draw.line([(x, row_bot), (x + 10, row_bot)], fill=(255, 165, 0), width=3)
+
+        # x_left / x_right (blue)
+        draw.line([(x_left,  0), (x_left,  h - 1)], fill=(0, 100, 255), width=3)
+        draw.line([(x_right, 0), (x_right, h - 1)], fill=(0, 100, 255), width=3)
+
+        # x_tip (red)
+        draw.line([(x_tip, 0), (x_tip, h - 1)], fill=(255, 30, 30), width=3)
+
+        # Text overlay
+        da   = float(row.get('delta_a_mm', 0))
+        wf   = float(row.get('W_full_mm',  0))
+        wl   = float(row.get('W_lig_mm',   0))
+        t_s  = float(row.get('time_s',     0))
+        onset_tag = '  ★ ONSET' if fnum == onset_frame else ''
+        lines = [
+            f'Frame {fnum}  t={t_s:.1f}s{onset_tag}',
+            f'Δa = {da:.3f} mm',
+            f'W_full = {wf:.3f} mm   W_lig = {wl:.3f} mm',
+        ]
+        y_txt = 10
+        for line in lines:
+            draw.text((10, y_txt), line, fill=(255, 255, 0), font=font)
+            y_txt += 42
+
+        out_path = out_dir / f'frame_{fnum:04d}_annotated.tif'
+        pil.save(str(out_path), format='TIFF')
+        print(f'  Saved: {out_path.name}')
+
+
+def ask_frames_to_export(df: pd.DataFrame, onset_frame: int) -> list:
+    """Show a dialog asking which frames to export as annotated TIF."""
+    import tkinter as tk
+    from tkinter import simpledialog
+
+    n_frames   = len(df)
+    last_frame = int(df['frame'].max())
+    suggestion = '0'
     if onset_frame >= 0:
-        mask = df['frame'] == onset_frame
-        t = df.loc[mask, 'time_s'].values
-        time_str = f'  (t = {t[0]:.3f} s)' if len(t) else ''
-        print(f'Crack propagation onset: frame {onset_frame}{time_str}')
-    else:
-        print('Crack propagation onset: not detected (Δa never exceeded threshold).')
+        suggestion += f', {onset_frame}'
+        suggestion += f', {min(onset_frame + 50, last_frame)}'
+        suggestion += f', {min(onset_frame + 100, last_frame)}'
+    suggestion += f', {last_frame}'
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+
+    answer = simpledialog.askstring(
+        'Export annotated TIFs',
+        f'Enter frame numbers to export as annotated TIF\n'
+        f'(comma-separated, range e.g. 0-10, or "none").\n'
+        f'Total frames: {n_frames}  |  Onset: {"frame " + str(onset_frame) if onset_frame >= 0 else "not detected"}\n\n'
+        f'Suggestion: {suggestion}',
+        initialvalue=suggestion,
+        parent=root,
+    )
+    root.destroy()
+
+    if not answer or answer.strip().lower() == 'none':
+        return []
+
+    result = []
+    for part in answer.split(','):
+        part = part.strip()
+        if '-' in part:
+            try:
+                a, b = part.split('-', 1)
+                result.extend(range(int(a), int(b) + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                result.append(int(part))
+            except ValueError:
+                pass
+    return sorted(set(result))
+
+
+def export_excel(df: pd.DataFrame, W_full_0_mm: float, output_path: str):
+    """Write an Excel file with per-frame measurements.
+    delta_a_mm and a_lambda_mm are forced monotonically non-decreasing
+    (cumulative max) and clipped to >= 0, since crack advance is irreversible.
+    """
+    a_0 = round(float(df['a_mm'].iloc[0]), 6)
+    delta_a_mono = df['delta_a_mm'].clip(lower=0).cummax().round(6)
+    a_lambda_mono = (a_0 + delta_a_mono).round(6)
+    out = pd.DataFrame({
+        'frame'        : df['frame'],
+        'a_0_mm'       : a_0,
+        'a_lambda_mm'  : a_lambda_mono,
+        'delta_a_mm'   : delta_a_mono,
+        'W_full_0_mm'  : round(W_full_0_mm, 6),
+        'W_full_mm'    : df['W_full_mm'].round(6),
+        'W_lig_mm'     : df['W_lig_mm'].round(6),
+    })
+    out.to_excel(output_path, index=False)
+    print(f'Excel saved   → {output_path}')
 
 
 # ── Session persistence ───────────────────────────────────────────────────────
 
 def save_session(df: pd.DataFrame, folder: str):
-    """Save corrected x_tip values to a JSON file in the image folder."""
+    """
+    Save corrected x_tip values and per-frame x_right / x_left corrections.
+
+    Session file format
+    -------------------
+    Integer keys              → x_tip corrections  (frame_index: x_tip_px)
+    "_xright_corrections"     → dict of frame_index: x_right_px (per-frame)
+    "_xleft_corrections"      → dict of frame_index: x_left_px  (per-frame)
+    "_x_right" / "_x_left"   → frame-0 values (backward-compat for old code)
+    """
+    # ── x_tip corrections ─────────────────────────────────────────────────────
     corrected = df[df['corrected'] == True]
     data = {str(int(row['frame'])): int(row['x_tip'])
             for _, row in corrected.iterrows()}
+
+    # ── per-frame x_right corrections ─────────────────────────────────────────
+    if 'x_right_corrected' in df.columns:
+        xr_corr = {str(int(fi)): int(df.loc[fi, 'x_right'])
+                   for fi in df.index if bool(df.loc[fi, 'x_right_corrected'])}
+        if xr_corr:
+            data['_xright_corrections'] = xr_corr
+
+    # ── per-frame x_left corrections ──────────────────────────────────────────
+    if 'x_left_corrected' in df.columns:
+        xl_corr = {str(int(fi)): int(df.loc[fi, 'x_left'])
+                   for fi in df.index if bool(df.loc[fi, 'x_left_corrected'])}
+        if xl_corr:
+            data['_xleft_corrections'] = xl_corr
+
+    # ── backward-compat: frame-0 values as single keys ────────────────────────
+    fi0 = df.index[0] if len(df) > 0 else None
+    if fi0 is not None:
+        data['_x_left']  = int(df.loc[fi0, 'x_left'])
+        data['_x_right'] = int(df.loc[fi0, 'x_right'])
+
     session_path = Path(folder) / '_va_session.json'
     with open(session_path, 'w') as f:
         json.dump(data, f, indent=2)
@@ -521,8 +831,13 @@ def save_session(df: pd.DataFrame, folder: str):
 
 def load_session(df: pd.DataFrame, folder: str) -> pd.DataFrame:
     """
-    Load and apply crack-tip corrections from a previous session file.
-    Returns the (possibly updated) DataFrame.
+    Load and apply corrections from a previous session file.
+
+    Supports both new format (_xright_corrections / _xleft_corrections dicts)
+    and legacy format (_x_right / _x_left single-value offset keys).
+
+    The 'corrected' flag columns must already exist in df (added by
+    process_all_frames).  If they are absent they are created here.
     """
     session_path = Path(folder) / '_va_session.json'
     if not session_path.exists():
@@ -531,15 +846,69 @@ def load_session(df: pd.DataFrame, folder: str) -> pd.DataFrame:
     with open(session_path) as f:
         data = json.load(f)
 
+    # Ensure corrected-flag columns exist
+    for col in ('x_right_corrected', 'x_left_corrected'):
+        if col not in df.columns:
+            df[col] = False
+
+    # ── x_right corrections ───────────────────────────────────────────────────
+    if '_xright_corrections' in data:
+        # New per-frame format
+        count = 0
+        for frame_str, xr in data['_xright_corrections'].items():
+            fi = int(frame_str)
+            if fi in df.index:
+                df.loc[fi, 'x_right']           = int(xr)
+                df.loc[fi, 'x_right_corrected'] = True
+                count += 1
+        print(f'  Restored {count} x_right anchor(s) from session.')
+    elif '_x_right' in data:
+        # Legacy: single offset — apply to all frames + mark frame 0 as anchor
+        xr0_auto      = int(df['x_right'].iloc[0])
+        xr0_corrected = int(data['_x_right'])
+        offset_xr     = xr0_corrected - xr0_auto
+        df['x_right'] = (df['x_right'] + offset_xr)
+        if 'x_right_raw' in df.columns:
+            df['x_right_raw'] = df['x_right_raw'] + offset_xr  # keep raw consistent
+        fi0 = df.index[0]
+        df.loc[fi0, 'x_right_corrected'] = True
+        print(f'  Restored x_right offset = {offset_xr:+d} px  '
+              f'(frame 0: {xr0_corrected} px)  [legacy format]')
+
+    # ── x_left corrections ────────────────────────────────────────────────────
+    if '_xleft_corrections' in data:
+        count = 0
+        for frame_str, xl in data['_xleft_corrections'].items():
+            fi = int(frame_str)
+            if fi in df.index:
+                df.loc[fi, 'x_left']           = int(xl)
+                df.loc[fi, 'x_left_corrected'] = True
+                count += 1
+        print(f'  Restored {count} x_left anchor(s) from session.')
+    elif '_x_left' in data:
+        xl0_auto      = int(df['x_left'].iloc[0])
+        xl0_corrected = int(data['_x_left'])
+        offset_xl     = xl0_corrected - xl0_auto
+        df['x_left']  = (df['x_left'] + offset_xl).clip(lower=0)
+        if 'x_left_raw' in df.columns:
+            df['x_left_raw'] = (df['x_left_raw'] + offset_xl).clip(lower=0)
+        fi0 = df.index[0]
+        df.loc[fi0, 'x_left_corrected'] = True
+        print(f'  Restored x_left offset = {offset_xl:+d} px  '
+              f'(frame 0: {xl0_corrected} px)  [legacy format]')
+
+    # ── x_tip corrections ─────────────────────────────────────────────────────
     count = 0
     for frame_str, x_tip in data.items():
+        if frame_str.startswith('_'):
+            continue
         fi = int(frame_str)
         if fi in df.index:
-            df.loc[fi, 'x_tip']    = int(x_tip)
+            df.loc[fi, 'x_tip']     = int(x_tip)
             df.loc[fi, 'corrected'] = True
             count += 1
 
-    print(f'Loaded {count} correction(s) from previous session ({session_path.name}).')
+    print(f'Loaded {count} x_tip correction(s) from session ({session_path.name}).')
     return df
 
 
@@ -577,11 +946,27 @@ def export_plot(df: pd.DataFrame, output_path: str, onset_frame: int = -1):
 
 def ask_parameters() -> dict:
     """
-    Collect run parameters interactively via tkinter dialogs.
-    Returns a dict with folder and scale_mm_per_pixel, or an empty dict if
-    cancelled.  All other parameters (notch side, fps, thresholds, W_full_0)
-    are determined automatically inside main().
+    Collect run parameters.
+    If called as:  python crack_analyser.py <folder> [scale]
+    uses command-line arguments directly (no dialog).
+    Otherwise opens tkinter dialogs.
     """
+    import sys
+
+    # ── Command-line mode ──────────────────────────────────────────────────────
+    if len(sys.argv) >= 2:
+        folder = sys.argv[1].strip('"').strip("'")
+        scale_s = sys.argv[2] if len(sys.argv) >= 3 else '0.01587'
+        try:
+            return {
+                'folder'            : folder,
+                'scale_mm_per_pixel': float(scale_s),
+            }
+        except ValueError as exc:
+            print(f'Parameter error: {exc}')
+            return {}
+
+    # ── Interactive dialog mode ────────────────────────────────────────────────
     root = tk.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
@@ -642,33 +1027,43 @@ def main():
     threshold = compute_otsu_threshold(first_img)
     print(f'Otsu threshold (first frame): {threshold}')
 
-    # ── Auto-detect W_full,0 from first frame ─────────────────────────────────
-    row_top_0, row_bottom_0 = detect_sample_row_range(first_img)
-    x_left_0, x_right_0    = detect_sample_edges(first_img, row_top_0, row_bottom_0, threshold)
-    W_full_0_px = x_right_0 - x_left_0
-    W_full_0_mm = W_full_0_px * params['scale_mm_per_pixel']
-    print(f'W_full,0 = {W_full_0_mm:.3f} mm  ({W_full_0_px} px)  |  '
-          f'Notch: {NOTCH_SIDE}  |  fps: {FPS}  |  '
-          f'Onset thresh: {ONSET_THRESHOLD_MM} mm')
-
-    # Store auto-detected values so the reviewer can access them
+    # Store fixed parameters so the reviewer can access them.
+    # W_full_0_mm is computed below after session load + edge smoothing.
     params.update({
-        'W_full_0_mm'       : W_full_0_mm,
         'notch_side'        : NOTCH_SIDE,
         'onset_threshold_mm': ONSET_THRESHOLD_MM,
         'img_threshold'     : threshold,
         'fps'               : FPS,
+        'W_full_0_mm'       : 0.0,   # placeholder — updated after session load
     })
 
-    # ── Batch auto-detection ──────────────────────────────────────────────────
-    df_raw = process_all_frames(paths, NOTCH_SIDE, threshold,
-                                x_left_fixed=x_left_0,
-                                x_right_fixed=x_right_0)
+    # ── Batch auto-detection (x_left, x_right, x_tip per frame) ──────────────
+    # x_left and x_right are detected per frame so W_full(λ) can reflect
+    # Poisson lateral contraction throughout the test.
+    df_raw = process_all_frames(paths, NOTCH_SIDE, threshold)
 
-    # ── Restore previous session if available ─────────────────────────────────
+    # ── Restore previous session (corrections become anchors) ─────────────────
+    # Load BEFORE smoothing so corrected frames act as hard anchors for
+    # smooth_sample_edges_with_anchors (linear interpolation between anchors).
     df_raw = load_session(df_raw, params['folder'])
 
-    # ── Smooth x_tip with rolling median (suppresses ±2-3 px noise) ──────────
+    # ── Smooth sample edges with anchor-based interpolation ───────────────────
+    # Corrected frames are kept exactly; uncorrected frames between two anchors
+    # get linear interpolation; frames outside the anchor range get a rolling
+    # median on the raw auto-detected values.
+    df_raw = smooth_sample_edges_with_anchors(df_raw, window=11)
+
+    # ── W_full,0 = corrected frame-0 width ────────────────────────────────────
+    x_left_used  = int(df_raw['x_left'].iloc[0])
+    x_right_used = int(df_raw['x_right'].iloc[0])
+    W_full_0_mm  = (x_right_used - x_left_used) * params['scale_mm_per_pixel']
+    params['W_full_0_mm'] = W_full_0_mm
+    print(f'W_full,0 = {W_full_0_mm:.3f} mm  '
+          f'(x_left={x_left_used}, x_right={x_right_used})  |  '
+          f'Notch: {NOTCH_SIDE}  |  fps: {FPS}  |  '
+          f'Onset thresh: {ONSET_THRESHOLD_MM} mm')
+
+    # ── Smooth x_tip with anchor-based interpolation + rolling median ─────────
     df_raw = smooth_crack_tips(df_raw, window=7)
     print(f'Smoothing applied (window=7).  '
           f'Max raw deviation: '
@@ -703,8 +1098,32 @@ def main():
     out_dir = Path(params['folder']) / '_results'
     out_dir.mkdir(exist_ok=True)
     export_csv(df, str(out_dir / 'crack_measurements.csv'), onset)
+    export_excel(df, W_full_0_mm, str(out_dir / 'crack_measurements.xlsx'))
     export_plot(df, str(out_dir / 'crack_measurements.png'), onset)
     save_session(df, params['folder'])   # session file stays next to the images
+
+    # ── Annotated TIF export ──────────────────────────────────────────────────
+    EXPORT_FRAMES = [0, 96, 192, 288, 384, 479, 575, 671, 767,
+                     863, 959, 1055, 1151, 1246, 1342, 1438, 1534]
+    tif_frames = [f for f in EXPORT_FRAMES if f in df['frame'].values]
+    print(f'\nExporting {len(tif_frames)} annotated TIF(s)...')
+    export_annotated_tif(df, paths, tif_frames, str(out_dir), onset)
+
+    # ── Crack advance report ──────────────────────────────────────────────────
+    max_da   = float(df['delta_a_mm'].max())
+    max_fr   = int(df.loc[df['delta_a_mm'] == df['delta_a_mm'].max(), 'frame'].iloc[0])
+    print()
+    print('=' * 50)
+    if onset >= 0:
+        t_onset = float(df.loc[df['frame'] == onset, 'time_s'].values[0])
+        print(f'  ✔  התקדמות קרע זוהתה!')
+        print(f'     Onset: פריים {onset}  (t = {t_onset:.1f} s)')
+        print(f'     מקסימום Δa = {max_da:.3f} מ"מ')
+    else:
+        print(f'  ✘  אין התקדמות קרע')
+        print(f'     מקסימום Δa = {max_da:.3f} מ"מ  (בפריים {max_fr})')
+        print(f'     סף ה-onset = {ONSET_THRESHOLD_MM:.2f} מ"מ  —  נדרשים עוד פריימים')
+    print('=' * 50)
 
 
 if __name__ == '__main__':

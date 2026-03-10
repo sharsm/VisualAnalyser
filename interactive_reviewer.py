@@ -30,7 +30,9 @@ from matplotlib.widgets import Button
 from pathlib import Path
 import numpy as np
 
-from crack_analyser import load_image, save_session, detect_crack_tip
+from crack_analyser import (load_image, save_session, detect_crack_tip,
+                            smooth_sample_edges_with_anchors,
+                            smooth_crack_tips)
 
 
 class InteractiveReviewer:
@@ -324,6 +326,7 @@ class InteractiveReviewer:
         x_new = int(round(np.clip(event.xdata, x_left, x_right)))
         self.df.loc[fi, 'x_tip']    = x_new
         self.df.loc[fi, 'corrected'] = True
+        self._reinterpolate_tips()
         self._recompute_all()
         self._save_session()
         self._update_display()
@@ -405,13 +408,21 @@ class InteractiveReviewer:
         scale = self.params['scale_mm_per_pixel']
 
         if self._drag_roi in ('xleft', 'xright'):
-            new_W0 = (new_xr - new_xl) * scale
-            print(f'Sample edges → x_left={new_xl}, x_right={new_xr}  '
-                  f'W_full_0 = {new_W0:.3f} mm')
-            self.df['x_left']  = new_xl
-            self.df['x_right'] = new_xr
-            self.params['W_full_0_mm'] = new_W0
-            self._redetect_frame(fi)
+            # ── Per-frame correction: only the current frame is updated ────
+            # All other frames will be re-interpolated between corrected anchors.
+            if self._drag_roi == 'xright':
+                self.df.loc[fi, 'x_right'] = new_xr
+                if 'x_right_corrected' in self.df.columns:
+                    self.df.loc[fi, 'x_right_corrected'] = True
+                print(f'Frame {fi}: x_right corrected → {new_xr} px')
+            else:
+                self.df.loc[fi, 'x_left'] = new_xl
+                if 'x_left_corrected' in self.df.columns:
+                    self.df.loc[fi, 'x_left_corrected'] = True
+                print(f'Frame {fi}: x_left corrected → {new_xl} px')
+            # Re-interpolate all frames between anchors, then recompute W_full_0
+            self._reinterpolate_edges()
+            # Do NOT re-detect x_tip — user's manual corrections must be preserved.
 
         else:  # top / bottom ROI
             print(f'ROI → row_top={new_top} ({new_top/h*100:.1f}%)  '
@@ -486,6 +497,36 @@ class InteractiveReviewer:
         self._update_display()
         print('Re-detection complete.')
 
+    # ── Edge re-interpolation ─────────────────────────────────────────────────
+
+    def _reinterpolate_edges(self):
+        """
+        Re-interpolate x_right / x_left for all uncorrected frames after a
+        per-frame correction has been applied to the current frame.
+
+        Uses linear interpolation between corrected anchor frames and a rolling
+        median fallback outside the anchor range (same logic as
+        smooth_sample_edges_with_anchors in crack_analyser).
+
+        Also updates params['W_full_0_mm'] from the (possibly changed) frame-0
+        x_right and x_left values.
+        """
+        self.df = smooth_sample_edges_with_anchors(self.df, window=11)
+
+        # Update W_full,0 from frame 0 (constant baseline)
+        fi0 = self.df.index[0]
+        xr0 = int(self.df.loc[fi0, 'x_right'])
+        xl0 = int(self.df.loc[fi0, 'x_left'])
+        self.params['W_full_0_mm'] = (xr0 - xl0) * self.params['scale_mm_per_pixel']
+
+    def _reinterpolate_tips(self):
+        """
+        Re-interpolate x_tip for all uncorrected frames after a correction.
+        Uses the same anchor-based logic as smooth_crack_tips in crack_analyser:
+        linear interpolation between corrected anchors, rolling median outside.
+        """
+        self.df = smooth_crack_tips(self.df, window=7)
+
     # ── Recompute measurements ────────────────────────────────────────────────
 
     def _recompute_all(self):
@@ -508,7 +549,7 @@ class InteractiveReviewer:
             self.df.at[i, 'a_mm']      = (1.0 - wl_mm / max(wf_mm, 1e-6)) * W0
 
         a_0 = float(self.df['a_mm'].iloc[0])
-        self.df['delta_a_mm'] = self.df['a_mm'] - a_0
+        self.df['delta_a_mm'] = (self.df['a_mm'] - a_0).clip(lower=0)
 
     def _save_session(self):
         if self.session_path is None:
